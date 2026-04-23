@@ -1,73 +1,93 @@
 // ============================================================
 // NSE / BSE Historical Stock Data — Power Query M Script
-// Calls your Render-hosted API (or localhost for local dev)
+// Handles large datasets by fetching in yearly chunks
 // ============================================================
 //
-// SETUP — Create these 3 Power Query Parameters first:
-//   Name          | Type   | Example value
-//   --------------|--------|-----------------------------
-//   PQ_FromDate   | Text   | 2020-01-01
-//   PQ_ToDate     | Text   | 2025-01-01
-//   PQ_Exchange   | Text   | ALL   (NSE | BSE | ALL)
-//
-// HOW TO CREATE PARAMETERS (Excel / Power BI):
-//   Home → Manage Parameters → New Parameter → fill Name + Type + Value
-//
-// Then paste this query in Advanced Editor.
-// The three parameters above will be picked up automatically.
+// PARAMETERS NEEDED (Home → Manage Parameters → New Parameter):
+//   PQ_FromDate  | Text | 2020-01-01
+//   PQ_ToDate    | Text | 2025-01-01
+//   PQ_Exchange  | Text | NSE   ← start with NSE only, not ALL
 // ============================================================
 
 let
-    // ── ① READ FROM POWER QUERY PARAMETERS ──────────────────────────────────
-    //    Change values in Manage Parameters — no need to edit this query.
-    FromDate = PQ_FromDate,
-    ToDate   = PQ_ToDate,
-    Exchange = PQ_Exchange,
+    // ── ① PARAMETERS ────────────────────────────────────────────────────────
+    FromDate  = PQ_FromDate,
+    ToDate    = PQ_ToDate,
+    Exchange  = PQ_Exchange,
+    BaseUrl   = "https://stock-data-api-b8jt.onrender.com",
 
-    // ── ② API BASE URL ───────────────────────────────────────────────────────
-    //    Local dev  → "http://localhost:5000"
-    //    Render     → "https://your-app-name.onrender.com"   ← replace this
-    BaseUrl = "https://your-app-name.onrender.com",
+    // ── ② GENERATE YEARLY DATE CHUNKS ───────────────────────────────────────
+    // Instead of one giant request, we split into 1-year chunks
+    // e.g. 2020-2025 becomes 5 separate API calls
+    FromYear  = Date.Year(Date.FromText(FromDate)),
+    ToYear    = Date.Year(Date.FromText(ToDate)),
 
-    // ── ③ BUILD HISTORY URL ──────────────────────────────────────────────────
-    HistoryUrl = BaseUrl
-        & "/history"
-        & "?from="     & FromDate
-        & "&to="       & ToDate
-        & "&exchange=" & Exchange,
+    YearList  = List.Numbers(FromYear, ToYear - FromYear + 1),
 
-    // ── ④ CALL THE API ───────────────────────────────────────────────────────
-    RawResponse = Web.Contents(
-        HistoryUrl,
-        [
-            Timeout = #duration(0, 2, 0, 0),     // 2-hour timeout (large dataset)
-            Headers = [Accept = "application/json"]
-        ]
+    // Build list of {from, to} pairs per year
+    DateChunks = List.Transform(
+        YearList,
+        each {
+            Date.ToText(#date(_, 1, 1),  "yyyy-MM-dd"),
+            Date.ToText(#date(_, 12, 31), "yyyy-MM-dd")
+        }
     ),
 
-    // ── ⑤ PARSE JSON → EXTRACT DATA ARRAY ───────────────────────────────────
-    JsonDoc  = Json.Document(RawResponse),
-    DataList = JsonDoc[data],
-
-    // ── ⑥ CONVERT LIST → TABLE ───────────────────────────────────────────────
-    RawTable = Table.FromList(
-        DataList,
-        Splitter.SplitByNothing(),
-        {"Row"},
-        null,
-        ExtraValues.Error
+    // Clamp first chunk start to actual FromDate
+    // Clamp last chunk end to actual ToDate
+    ClampedChunks = List.Transform(
+        List.Positions(DateChunks),
+        (i) =>
+            let
+                chunk     = DateChunks{i},
+                chunkFrom = if i = 0 then FromDate else chunk{0},
+                chunkTo   = if i = List.Count(DateChunks) - 1 then ToDate else chunk{1}
+            in
+                {chunkFrom, chunkTo}
     ),
 
-    // ── ⑦ EXPAND ALL RECORD FIELDS ───────────────────────────────────────────
-    Expanded = Table.ExpandRecordColumn(
-        RawTable, "Row",
-        {"Date", "Symbol", "Open", "High", "Low", "Close", "Volume"},
-        {"Date", "Symbol", "Open", "High", "Low", "Close", "Volume"}
+    // ── ③ FETCH ONE YEAR AT A TIME ───────────────────────────────────────────
+    FetchChunk = (fromD as text, toD as text) =>
+        let
+            Url = BaseUrl
+                & "/history"
+                & "?from="     & fromD
+                & "&to="       & toD
+                & "&exchange=" & Exchange,
+
+            Raw  = Web.Contents(
+                Url,
+                [
+                    Timeout = #duration(0, 1, 30, 0),  // 90-min timeout per chunk
+                    Headers = [Accept = "application/json"]
+                ]
+            ),
+            Json     = Json.Document(Raw),
+            DataList = Json[data],
+            AsTable  = Table.FromList(
+                            DataList,
+                            Splitter.SplitByNothing(),
+                            {"Row"}, null, ExtraValues.Error
+                        ),
+            Expanded = Table.ExpandRecordColumn(
+                            AsTable, "Row",
+                            {"Date","Symbol","Open","High","Low","Close","Volume"},
+                            {"Date","Symbol","Open","High","Low","Close","Volume"}
+                        )
+        in
+            Expanded,
+
+    // ── ④ COMBINE ALL CHUNKS ─────────────────────────────────────────────────
+    AllChunks = List.Transform(
+        ClampedChunks,
+        (chunk) => FetchChunk(chunk{0}, chunk{1})
     ),
 
-    // ── ⑧ SET DATA TYPES ─────────────────────────────────────────────────────
+    Combined = Table.Combine(AllChunks),
+
+    // ── ⑤ SET DATA TYPES ─────────────────────────────────────────────────────
     Typed = Table.TransformColumnTypes(
-        Expanded,
+        Combined,
         {
             {"Date",   type date},
             {"Symbol", type text},
@@ -79,7 +99,7 @@ let
         }
     ),
 
-    // ── ⑨ DERIVE Exchange + Clean Ticker columns ─────────────────────────────
+    // ── ⑥ ADD Exchange + Ticker COLUMNS ──────────────────────────────────────
     WithExchange = Table.AddColumn(
         Typed, "Exchange",
         each if Text.EndsWith([Symbol], ".NS") then "NSE"
@@ -94,10 +114,10 @@ let
         type text
     ),
 
-    // ── ⑩ FINAL COLUMN ORDER + SORT ──────────────────────────────────────────
+    // ── ⑦ REORDER + SORT ─────────────────────────────────────────────────────
     Reordered = Table.ReorderColumns(
         WithTicker,
-        {"Date", "Ticker", "Exchange", "Symbol", "Open", "High", "Low", "Close", "Volume"}
+        {"Date","Ticker","Exchange","Symbol","Open","High","Low","Close","Volume"}
     ),
 
     Sorted = Table.Sort(
@@ -107,46 +127,3 @@ let
 
 in
     Sorted
-
-
-// ============================================================
-// BONUS QUERY A — Live Ticker List (paste in a NEW blank query)
-// Shows all tickers the API currently knows, with exchange label
-// ============================================================
-//
-// let
-//     BaseUrl    = "https://your-app-name.onrender.com",
-//     Exchange   = PQ_Exchange,
-//     Url        = BaseUrl & "/tickers?exchange=" & Exchange,
-//     Response   = Web.Contents(Url),
-//     Json       = Json.Document(Response),
-//     TickerList = Json[tickers],
-//     AsTable    = Table.FromList(
-//                     TickerList,
-//                     Splitter.SplitByNothing(),
-//                     {"Symbol"}, null, ExtraValues.Error
-//                  ),
-//     WithExch   = Table.AddColumn(
-//                     AsTable, "Exchange",
-//                     each if Text.EndsWith([Symbol], ".NS") then "NSE" else "BSE",
-//                     type text
-//                  ),
-//     WithTicker = Table.AddColumn(
-//                     WithExch, "Ticker",
-//                     each Text.BeforeDelimiter([Symbol], "."),
-//                     type text
-//                  )
-// in
-//     WithTicker
-//
-// ============================================================
-// BONUS QUERY B — API Health Check (paste in a NEW blank query)
-// ============================================================
-//
-// let
-//     Url      = "https://your-app-name.onrender.com/health",
-//     Response = Web.Contents(Url),
-//     Json     = Json.Document(Response),
-//     AsTable  = Record.ToTable(Json)
-// in
-//     AsTable
